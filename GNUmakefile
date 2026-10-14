@@ -66,8 +66,7 @@ endif
 # try to generate a unique GDB port
 GDBPORT	:= $(shell expr `id -u` % 5000 + 25000)
 
-CC	:= $(GCCPREFIX)gcc -pipe
-GDB	:= $(GCCPREFIX)gdb
+CC	:= gcc-12 -pipe
 AS	:= $(GCCPREFIX)as
 AR	:= $(GCCPREFIX)ar
 LD	:= $(GCCPREFIX)ld
@@ -88,7 +87,7 @@ CFLAGS := $(CFLAGS) $(DEFS) $(LABDEFS) -O1 -fno-builtin -I$(TOP) -MD
 CFLAGS += -fno-omit-frame-pointer
 CFLAGS += -std=gnu99
 CFLAGS += -static
-CFLAGS += -Wall -Wno-format -Wno-unused -Werror -gstabs -m32
+CFLAGS += -Wall -Wno-format -Wno-unused -gstabs -m32
 # -fno-tree-ch prevented gcc from sometimes reordering read_ebp() before
 # mon_backtrace()'s function prologue on gcc version: (Debian 4.7.2-5) 4.7.2
 CFLAGS += -fno-tree-ch
