@@ -11,6 +11,9 @@
 #include <kern/monitor.h>
 #include <kern/kdebug.h>
 
+#include <kern/pmap.h>     // kern_pgdir, KADDR
+#include <inc/mmu.h>       // PTE_P, PTE_W, PTE_U, PTE_PS, PTE_ADDR
+
 #define CMDBUF_SIZE	80	// enough for one VGA text line
 
 
@@ -25,7 +28,41 @@ static struct Command commands[] = {
 	{ "help", "Display this list of commands", mon_help },
 	{ "kerninfo", "Display information about the kernel", mon_kerninfo },
 	{ "backtrace", "Stack backtrace", mon_backtrace },
+	{ "showmappings", "Show page mappings for a VA range", mon_showmappings },
+	{ "setperm", "Set/Clear page permissions", mon_setperm },
+	{ "dumpva", "Dump virtual address range", mon_dumpva },
+	{ "dumppa", "Dump physical address range", mon_dumppa },
 };
+
+static uint32_t
+parse_hex(const char *s)
+{
+    uint32_t v = 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        s += 2;
+    while (*s) {
+        int d;
+        if (*s >= '0' && *s <= '9')       d = *s - '0';
+        else if (*s >= 'a' && *s <= 'f')  d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'F')  d = *s - 'A' + 10;
+        else break;
+        v = v * 16 + d;
+        s++;
+    }
+    return v;
+}
+
+static int
+query_mapping(pde_t *pgdir, uintptr_t va, physaddr_t *pa, pte_t *perm)
+{
+    pte_t *pte = pgdir_walk(pgdir, (void *)va, 0);
+    if (!pte || !(*pte & PTE_P))
+        return -1;
+
+    *pa   = PTE_ADDR(*pte) | (va & 0xFFF);
+    *perm = *pte & 0xFFF;
+    return 0;
+}
 
 /***** Implementations of basic kernel monitor commands *****/
 
@@ -76,8 +113,201 @@ mon_backtrace(int argc, char **argv, struct Trapframe *tf)
 	return 0;
 }
 
+int
+mon_showmappings(int argc, char **argv, struct Trapframe *tf)
+{
+	if (argc != 3) {
+        cprintf("Usage: showmappings <va_start> <va_end>\n");
+        return 0;
+    }
+	uintptr_t va_start = parse_hex(argv[1]);
+	uintptr_t va_end = parse_hex(argv[2]);
+	if (va_start > va_end) {
+        uintptr_t t = va_start; va_start = va_end; va_end = t;
+    }
+	pde_t *pgdir = kern_pgdir;
+	cprintf("VA         -> PA         perm:P W U\n");
+	for(uintptr_t va = ROUNDDOWN(va_start, PGSIZE); va <= va_end; va += PGSIZE){
+		physaddr_t pa;
+		pte_t perm;
+		if(query_mapping(pgdir, va, &pa, &perm) < 0){
+			cprintf("0x%08x -> not mapped\n", va);
+		}else{
+			cprintf("0x%08x -> 0x%08x  %c%c%c\n",
+                va, pa,
+                (perm & PTE_P) ? 'P' : '-',
+                (perm & PTE_W) ? 'W' : '-',
+                (perm & PTE_U) ? 'U' : '-');
+		}
+	}
+    return 0;
+}
 
+int
+mon_setperm(int argc, char **argv, struct Trapframe *tf)
+{
+	if (argc != 3) {
+        cprintf("Usage: setperm <va> +w|-w|+u|-u\n");
+        return 0;
+    }
+	uintptr_t va = parse_hex(argv[1]);
+	char op    = argv[2][0];
+    char which = argv[2][1];
 
+	pde_t *pgdir = kern_pgdir;
+	pte_t *pte = pgdir_walk(pgdir, (void *)va, 0);
+	if(!pte || !(*pte & PTE_P)){
+		cprintf("VA 0x%08x not mapped\n", va);
+		return 0;
+	}
+
+	if(op == '+'){
+		if(which == 'w') 		*pte = *pte | PTE_W;
+		else if(which == 'U')	*pte = *pte | PTE_U;
+		else goto bad;
+	}
+	else if(op == '-'){
+		if(which == 'w')		*pte = *pte & (~PTE_W);
+		else if(which == 'U')	*pte = *pte & (~PTE_U);
+		else goto bad;
+	}
+	else{
+		goto bad;
+	}
+
+	tlb_invalidate(pgdir, (void *) va);
+
+	cprintf("VA 0x%08x perm updated: %c%c%c\n",
+        va,
+        (*pte & PTE_P) ? 'P' : '-',
+        (*pte & PTE_W) ? 'W' : '-',
+        (*pte & PTE_U) ? 'U' : '-');
+    return 0;
+
+bad:
+	cprintf("Usage: setperm <va> +w|-w|+u|-u\n");
+	return 0;
+}
+
+int
+mon_dumpva(int argc, char **argv, struct Trapframe *tf)
+{
+	if (argc != 3) {
+        cprintf("Usage: dumpva <va_start> <va_end>\n");
+        return 0;
+    }
+
+	uintptr_t start = parse_hex(argv[1]);
+	uintptr_t end = parse_hex(argv[2]);
+	if (start > end) {
+        uintptr_t t = start; start = end; end = t;
+    }
+
+	pde_t *pgdir = kern_pgdir;
+
+	for(uintptr_t va = ROUNDDOWN(start, PGSIZE); va <= end; va += PGSIZE){
+		pte_t *pte = pgdir_walk(pgdir,(void *) va, 0);
+		if(!pte || !(*pte & PTE_P)){
+			cprintf("0x%08x: <not mapped>\n", va);
+			continue;
+		}
+		physaddr_t pa_base = PTE_ADDR(*pte);
+
+		uintptr_t va1 = (va < start) ? start : va;
+		uintptr_t va2 = (va + PGSIZE -1 < end)? va + PGSIZE -1 : end;
+
+		uintptr_t line_start = ROUNDDOWN(va1, 16);
+
+		for (uintptr_t line = line_start; line <= va2; line += 16) {
+            cprintf("0x%08x: ", line);
+
+            uint8_t buf[16];
+			int valid[16];
+
+            for (int j = 0; j < 16; j++) {
+                uintptr_t cur = line + j;
+                if (cur >= va1 && cur <= va2) {
+                    buf[j]   = *(uint8_t *)KADDR(pa_base + (cur & 0xFFF));
+                    valid[j] = 1;
+                } else {
+                    valid[j] = 0;
+                }
+            }
+
+            for (int j = 0; j < 16; j++) {
+                if (valid[j]) cprintf("%02x ", buf[j]);
+                else       cprintf("   ");
+                if (j == 7) cprintf(" ");
+            }
+
+            cprintf(" |");
+
+            for (int j = 0; j < 16; j++) {
+                if (!valid[j])
+                    cprintf(" ");
+                else
+                    cprintf("%c", (buf[j] >= 32 && buf[j] < 127) ? buf[j] : '.');
+            }
+            cprintf("|\n");
+        }
+	}
+	return 0;
+}
+
+int
+mon_dumppa(int argc, char **argv, struct Trapframe *tf)
+{
+	if (argc != 3) {
+        cprintf("Usage: dumppa <pa_start> <pa_end>\n");
+        return 0;
+    }
+
+	uintptr_t start = parse_hex(argv[1]);
+    uintptr_t end   = parse_hex(argv[2]);
+    if (start > end) {
+        uintptr_t t = start; start = end; end = t;
+    }
+
+	if (end >= 0x10000000) {
+        cprintf("physical range exceeds 256MB mapped window\n");
+        return 0;
+    }
+
+	uintptr_t line_start = ROUNDDOWN(start, 16);
+
+	for (uintptr_t line = line_start; line <= end; line += 16) {
+        cprintf("0x%08x: ", line);
+
+        uint8_t buf[16];
+        int valid[16];
+
+        for (int j = 0; j < 16; j++) {
+            uintptr_t cur = line + j;
+            if (cur >= start && cur <= end) {
+                buf[j]   = *(uint8_t *)KADDR(cur);
+                valid[j] = 1;
+            } else {
+                valid[j] = 0;
+            }
+        }
+
+        for (int j = 0; j < 16; j++) {
+            if (valid[j]) cprintf("%02x ", buf[j]);
+            else          cprintf("   ");
+            if (j == 7) cprintf(" ");
+        }
+
+        cprintf(" |");
+        for (int j = 0; j < 16; j++) {
+            if (!valid[j])
+                cprintf(" ");
+            else
+                cprintf("%c", (buf[j] >= 32 && buf[j] < 127) ? buf[j] : '.');
+        }
+        cprintf("|\n");
+    }
+	return 0;
+}
 /***** Kernel monitor command interpreter *****/
 
 #define WHITESPACE "\t\r\n "
